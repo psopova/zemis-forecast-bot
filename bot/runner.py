@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from . import config, research as research_mod
 from .client import MetaculusClient, MetaculusError, already_forecast, sub_questions
 from .forecast import CONTINUOUS_TYPES, build_context, forecast_question, search_queries
-from .llm import USAGE, LLMError, resolve_models
+from .llm import DEAD_MODELS, USAGE, LLMError, NoModelsAvailable, metaculus_proxy_models, resolve_models
 
 log = logging.getLogger("bot")
 
@@ -112,6 +112,7 @@ def run_tick(client: MetaculusClient, tournaments: list[str], models: list[str],
 
     log.info("forecasting %d question(s) with %s", len(targets), ", ".join(models))
     done = 0
+    outage = 0
     with cf.ThreadPoolExecutor(max_workers=config.QUESTION_WORKERS) as pool:
         futures = {
             pool.submit(handle_one, client, post, question, models, runs): question.get("id")
@@ -122,10 +123,23 @@ def run_tick(client: MetaculusClient, tournaments: list[str], models: list[str],
             try:
                 fut.result()
                 done += 1
+            except NoModelsAvailable as exc:
+                outage += 1
+                log.error("q%s skipped, no model available: %s", qid, str(exc)[:300])
             except (LLMError, MetaculusError, ValueError) as exc:
                 log.error("q%s failed: %s", qid, str(exc)[:400])
             except Exception:  # noqa: BLE001 - one bad question must not end the tick
                 log.error("q%s crashed:\n%s", qid, traceback.format_exc()[:1500])
+    if outage:
+        # Grinding through the rest of the list would be hundreds of doomed
+        # requests against a shared proxy. The questions are untouched and the
+        # next poll picks them up.
+        log.error(
+            "%d question(s) skipped because no model was reachable. Dead models: %s. "
+            "Nothing was submitted for them, so they will be retried next run.",
+            outage,
+            ", ".join(sorted(DEAD_MODELS)) or "none recorded",
+        )
     return done
 
 
@@ -146,6 +160,10 @@ def check_sources() -> int:
         print(json.dumps({"models_resolved": models}, indent=2))
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"models_error": str(exc)}, indent=2))
+
+    # Guessing a name the proxy does not serve costs a whole run, so ask it.
+    proxy = metaculus_proxy_models()
+    print(json.dumps({"metaculus_proxy_models": proxy or "none listed"}, indent=2))
     return 0 if by_source else 1
 
 

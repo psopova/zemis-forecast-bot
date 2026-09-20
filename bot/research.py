@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import html
 import logging
+import time
 import os
 import re
 from dataclasses import dataclass, field
@@ -116,7 +117,13 @@ def asknews(query: str, report: ResearchReport, n: int = 8) -> None:
 
 
 def gdelt(query: str, report: ResearchReport, n: int = 8, days: int = 21) -> None:
-    """GDELT's document API is public, keyless and unmetered."""
+    """GDELT's document API is public and keyless, but it rate-limits hard.
+
+    GitHub Actions runners share a small pool of egress addresses, so 429 is the
+    common case there rather than the exception. One short retry is worth it; a
+    long one is not, because the question closes in three hours and every other
+    source is still available.
+    """
     try:
         params = {
             "query": query,
@@ -132,7 +139,17 @@ def gdelt(query: str, report: ResearchReport, n: int = 8, days: int = 21) -> Non
             headers=UA,
             timeout=TIMEOUT,
         )
+        if resp.status_code == 429:
+            time.sleep(3)
+            resp = requests.get(
+                "https://api.gdeltproject.org/api/v2/doc/doc",
+                params=params,
+                headers=UA,
+                timeout=TIMEOUT,
+            )
         resp.raise_for_status()
+        if "json" not in (resp.headers.get("content-type") or ""):
+            raise ValueError(f"non-JSON response: {resp.text[:80]!r}")
         for art in (resp.json().get("articles") or [])[:n]:
             report.add(
                 Evidence(
@@ -292,7 +309,7 @@ def gather(queries: list[str], include_markets: bool = True) -> ResearchReport:
     primary = queries[0]
 
     for fn in NEWS_SOURCES:
-        for q in queries[:3]:
+        for q in queries[:2 if fn is not gdelt else 1]:
             fn(q, report)
             if fn is asknews and report.items:
                 break  # the free allocation is finite; one good call is enough

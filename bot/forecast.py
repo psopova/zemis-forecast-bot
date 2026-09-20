@@ -15,7 +15,13 @@ from typing import Any, Sequence
 
 from . import aggregate, parsing, prompts
 from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, build_cdf, safe_cdf
-from .llm import LLMError, chat_with_fallback, extract_json, run_parallel
+from .llm import (
+    LLMError,
+    NoModelsAvailable,
+    chat_with_fallback,
+    extract_json,
+    run_parallel,
+)
 from .scaling import Scaling
 
 log = logging.getLogger(__name__)
@@ -150,11 +156,20 @@ def _run_ensemble(messages, models: Sequence[str], runs: int, temperature: float
         ordered = list(models[i % len(models):]) + list(models[: i % len(models)])
         tasks.append(lambda o=ordered: chat_with_fallback(messages, o, temperature=temperature))
     out: list[tuple[str, str]] = []
+    dead = 0
     for result in run_parallel(tasks, workers=min(runs, 5)):
         if isinstance(result, Exception):
+            if isinstance(result, NoModelsAvailable):
+                dead += 1
             log.warning("ensemble member failed: %s", str(result)[:200])
             continue
         out.append(result)
+    if not out and dead:
+        # Nothing answered at all. That is the LLM layer being down, not the
+        # models being unsure, and the two must not be confused: see the callers.
+        raise NoModelsAvailable(
+            f"all {runs} ensemble members failed because every model is unavailable"
+        )
     return out
 
 
@@ -213,8 +228,15 @@ def forecast_numeric(ctx: dict, research: str, models: Sequence[str], runs: int)
 
     scaling: Scaling = ctx["scaling"]
     count = ctx["inbound_outcome_count"]
+    if not parsed_runs and not results:
+        # Submitting a uniform here would be the worst of both worlds: it scores
+        # badly AND marks the question as forecast, so the bot never returns to
+        # it once the outage clears. Fail instead, and let the next poll retry.
+        raise NoModelsAvailable(
+            "no ensemble member responded; refusing to submit a placeholder distribution"
+        )
     if not parsed_runs:
-        notes.append("no usable percentiles from any member; submitting a uniform distribution")
+        notes.append("models responded but no usable percentiles; submitting a uniform distribution")
         cdf = safe_cdf(count, ctx["open_lower_bound"], ctx["open_upper_bound"])
         return (
             {"question": ctx["question_id"], "continuous_cdf": cdf},
@@ -274,9 +296,13 @@ def forecast_multiple_choice(ctx: dict, research: str, models: Sequence[str], ru
         parsed_runs.append(got)
         used.append(model)
 
+    if not parsed_runs and not results:
+        raise NoModelsAvailable(
+            "no ensemble member responded; refusing to submit a placeholder distribution"
+        )
     merged = aggregate.aggregate_multiple_choice(parsed_runs, options)
     if merged is None:
-        notes.append("no usable model output; submitting the uniform over options")
+        notes.append("models responded but no usable option probabilities; using the uniform")
         merged = {o: 1.0 / len(options) for o in options}
     final = aggregate.calibrate_multiple_choice(merged, options)
     top = max(final, key=lambda o: final[o])

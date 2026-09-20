@@ -78,6 +78,23 @@ class LLMError(RuntimeError):
     pass
 
 
+class ModelUnavailable(LLMError):
+    """The model will never work with these credentials: wrong name, or no allowance.
+
+    Distinct from a transient failure. Retrying it on the next question wastes a
+    request and, when the whole ensemble is unavailable, turns one dead provider
+    into hundreds of pointless calls a minute against a shared proxy.
+    """
+
+
+class NoModelsAvailable(LLMError):
+    """Every model in the ensemble is unavailable. The run cannot forecast at all."""
+
+
+# Models that answered with an allowance or authentication error this process.
+DEAD_MODELS: set[str] = set()
+
+
 @dataclass
 class Usage:
     calls: int = 0
@@ -109,15 +126,27 @@ def _provider_for(model: str) -> tuple[Provider, str]:
     for name, prov in PROVIDERS.items():
         prefix = f"{name}/"
         if model.startswith(prefix):
-            return prov, model[len(prefix):]
+            return prov, _adapt_model_name(prov, model[len(prefix):])
     order = ["openrouter", "metaculus", "gemini", "groq"]
     for name in order:
         if PROVIDERS[name].key:
-            return PROVIDERS[name], model
+            return PROVIDERS[name], _adapt_model_name(PROVIDERS[name], model)
     raise LLMError(
         "No LLM credentials found. Set OPENROUTER_API_KEY (tournament credits), "
         "or METACULUS_TOKEN to use the Metaculus proxy, or GEMINI_API_KEY / GROQ_API_KEY."
     )
+
+
+def _adapt_model_name(prov: Provider, model: str) -> str:
+    """OpenRouter uses ``vendor/model``; the other providers want the bare name.
+
+    Sending "openai/gpt-5" to the Metaculus proxy produced
+    "You don\'t have an allowance for model <openai/gpt-5> on <Openai>", because
+    the vendor prefix is part of the name it looks up.
+    """
+    if prov.name == "openrouter":
+        return model
+    return model.split("/", 1)[1] if "/" in model else model
 
 
 def chat(
@@ -165,6 +194,11 @@ def chat(
             last = f"HTTP {resp.status_code}"
             time.sleep(min(2 ** attempt, 30))
             continue
+        if resp.status_code in (400, 401, 403, 404):
+            DEAD_MODELS.add(model)
+            raise ModelUnavailable(
+                f"{prov.name} {bare_model} -> HTTP {resp.status_code}: {resp.text[:300]}"
+            )
         if not resp.ok:
             raise LLMError(f"{prov.name} {bare_model} -> HTTP {resp.status_code}: {resp.text[:400]}")
 
@@ -190,12 +224,23 @@ def chat_with_fallback(
 ) -> tuple[str, str]:
     """Try each model in turn. Returns (text, model_that_answered)."""
     errors = []
-    for model in models:
+    live = [m for m in models if m not in DEAD_MODELS]
+    if not live:
+        raise NoModelsAvailable(
+            "every model is unavailable with the current credentials: "
+            + ", ".join(sorted(DEAD_MODELS))
+        )
+    for model in live:
         try:
             return chat(messages, model, **kwargs), model
+        except ModelUnavailable as exc:
+            errors.append(f"{model}: {exc}")
+            log.warning("model %s is unavailable, will not retry it: %s", model, str(exc)[:200])
         except LLMError as exc:
             errors.append(f"{model}: {exc}")
             log.warning("model %s failed, trying next: %s", model, str(exc)[:200])
+    if all(m in DEAD_MODELS for m in models):
+        raise NoModelsAvailable("all models failed permanently:\n" + "\n".join(errors))
     raise LLMError("all models failed:\n" + "\n".join(errors))
 
 
@@ -208,13 +253,14 @@ def _catalogue() -> list[dict]:
     if _CATALOGUE_CACHE is not None:
         return _CATALOGUE_CACHE
     prov = PROVIDERS["openrouter"]
-    if not prov.key:
-        _CATALOGUE_CACHE = []
-        return _CATALOGUE_CACHE
+    # This endpoint needs no credentials, so the resolver still works before the
+    # tournament credits arrive. Gating it on a key was why a run with no key
+    # fell back to hardcoded model names that no longer exist.
+    headers = {"Authorization": f"Bearer {prov.key}"} if prov.key else {}
     try:
         resp = requests.get(
             f"{prov.base_url}/models",
-            headers={"Authorization": f"Bearer {prov.key}"},
+            headers=headers,
             timeout=30,
         )
         resp.raise_for_status()
@@ -322,3 +368,32 @@ def run_parallel(tasks: Sequence[Callable[[], Any]], workers: int = 6) -> list[A
             except Exception as exc:  # noqa: BLE001 - surfaced to the caller
                 results[i] = exc
     return results
+
+
+def metaculus_proxy_models() -> list[str]:
+    """Ask the Metaculus LLM proxy which models the bot token is allowed to use.
+
+    The proxy rejects a name it does not recognise with an "allowance" error, so
+    guessing is expensive. This is reported by --check-sources.
+    """
+    prov = PROVIDERS["metaculus"]
+    if not prov.key:
+        return []
+    try:
+        resp = requests.get(
+            f"{prov.base_url}/models",
+            headers={"Authorization": f"Token {prov.key}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not list the Metaculus proxy models: %s", str(exc)[:200])
+        return []
+    entries = data.get("data") if isinstance(data, dict) else data
+    out = []
+    for entry in entries or []:
+        mid = entry.get("id") if isinstance(entry, dict) else entry
+        if mid:
+            out.append(str(mid))
+    return sorted(out)
