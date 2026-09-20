@@ -32,14 +32,71 @@ def test_extract_json_rejects_garbage(text):
         extract_json(text)
 
 
-def test_resolve_models_falls_back_without_a_catalogue(monkeypatch):
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+        self.status_code = 200
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def test_resolve_models_falls_back_when_the_catalogue_is_unreachable(monkeypatch):
+    """An unreachable catalogue must degrade to the static list, not crash."""
     monkeypatch.delenv("BOT_MODELS", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     import bot.llm as llm
 
+    def boom(*args, **kwargs):
+        raise OSError("no route to host")
+
+    monkeypatch.setattr(llm.requests, "get", boom)
     llm._CATALOGUE_CACHE = None
-    picked = resolve_models(3)
-    assert picked == STATIC_FALLBACK[:3]
+    try:
+        assert resolve_models(3) == STATIC_FALLBACK[:3]
+    finally:
+        llm._CATALOGUE_CACHE = None
+
+
+def test_the_catalogue_is_read_without_a_key(monkeypatch):
+    """The endpoint is public, and gating it on a key was the original bug.
+
+    Before the fix, a run with no OpenRouter key skipped the catalogue entirely
+    and used hardcoded model names from training data, which the Metaculus proxy
+    then rejected. The resolver must use the live catalogue either way.
+    """
+    monkeypatch.delenv("BOT_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    import bot.llm as llm
+
+    seen = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        seen["url"] = url
+        seen["headers"] = headers
+        return _FakeResponse(
+            {
+                "data": [
+                    {"id": "openai/gpt-9-turbo", "created": 30},
+                    {"id": "anthropic/claude-opus-9", "created": 20},
+                    {"id": "google/gemini-9-pro", "created": 25},
+                ]
+            }
+        )
+
+    monkeypatch.setattr(llm.requests, "get", fake_get)
+    llm._CATALOGUE_CACHE = None
+    try:
+        picked = resolve_models(3)
+    finally:
+        llm._CATALOGUE_CACHE = None
+
+    assert seen["headers"] == {}, "no credentials should be sent"
+    assert picked == ["openai/gpt-9-turbo", "anthropic/claude-opus-9", "google/gemini-9-pro"]
+    assert picked != STATIC_FALLBACK[:3]
 
 
 def test_resolve_models_honours_an_explicit_override(monkeypatch):

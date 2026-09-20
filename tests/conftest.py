@@ -1,14 +1,38 @@
-"""Make the package importable however the tests are invoked.
+"""Test setup: make the package importable, and keep the tests off the network.
 
-Without this, `pytest tests/` puts only the tests directory on the path and the
-imports fail, while `python -m pytest` happens to work because it adds the
-working directory. Pinning it here means both spellings behave the same on any
-machine.
+Without the path line, `pytest tests/` puts only the tests directory on the
+path and the imports fail, while `python -m pytest` happens to work because it
+adds the working directory. Pinning it here means both spellings behave the
+same on any machine.
+
+The network guard exists because of a real CI failure. A test asserted that the
+model resolver falls back to a hardcoded list, and it passed for weeks, but only
+because the machine it was written on could not reach the model catalogue. The
+moment it ran somewhere with working network the fetch succeeded, the resolver
+returned real models, and the assertion broke. A test whose result depends on
+whether the network happens to be reachable is not testing anything. So a real
+HTTP call inside a test now fails loudly instead of quietly changing the answer.
 """
 
 import sys
 from pathlib import Path
 
+import pytest
+import requests
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture(autouse=True)
+def no_real_http(monkeypatch):
+    def blocked(*args, **kwargs):
+        raise AssertionError(
+            "a test tried to make a real HTTP request. Stub it: a test that "
+            "depends on network reachability passes or fails for the wrong reason."
+        )
+
+    monkeypatch.setattr(requests, "get", blocked)
+    monkeypatch.setattr(requests, "post", blocked)
+    monkeypatch.setattr(requests.Session, "request", blocked)
