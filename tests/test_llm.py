@@ -131,3 +131,100 @@ def test_preference_patterns_compile():
     for pattern, score in MODEL_PREFERENCES:
         re.compile(pattern)
         assert 0 < score <= 100
+
+
+# --------------------------------------------------------------------------
+# Live-run findings: the catalogue handed back routing variants, and with no
+# OpenRouter key the resolver must follow whichever provider does have one.
+# --------------------------------------------------------------------------
+def test_routing_variants_are_rejected(monkeypatch):
+    """":batch" can take hours to return, against a three hour question window."""
+    monkeypatch.delenv("BOT_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    import bot.llm as llm
+
+    llm._CATALOGUE_CACHE = [
+        {"id": "openai/gpt-6-astra:batch", "created": 99},
+        {"id": "openai/gpt-6-astra", "created": 98},
+        {"id": "anthropic/claude-fable-5.1:batch", "created": 97},
+        {"id": "anthropic/claude-fable-5.1", "created": 96},
+        {"id": "google/gemini-2.5-pro:batch", "created": 95},
+        {"id": "google/gemini-2.5-pro", "created": 94},
+    ]
+    try:
+        picked = resolve_models(3)
+    finally:
+        llm._CATALOGUE_CACHE = None
+    assert not any(":" in m for m in picked), picked
+    assert picked == [
+        "openai/gpt-6-astra",
+        "anthropic/claude-fable-5.1",
+        "google/gemini-2.5-pro",
+    ]
+
+
+def test_resolution_follows_the_provider_that_has_a_key(monkeypatch):
+    """With only a Gemini key, the ensemble must be Gemini models, prefixed."""
+    import bot.llm as llm
+
+    monkeypatch.delenv("BOT_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+
+    def fake_get(url, headers=None, timeout=None):
+        assert "generativelanguage" in url, url
+        return _FakeResponse(
+            {
+                "data": [
+                    {"id": "models/gemini-2.5-flash-lite"},
+                    {"id": "models/gemini-2.5-pro"},
+                    {"id": "models/gemini-2.5-flash"},
+                ]
+            }
+        )
+
+    monkeypatch.setattr(llm.requests, "get", fake_get)
+    llm._CATALOGUE_CACHE = None
+    try:
+        picked = resolve_models(2)
+    finally:
+        llm._CATALOGUE_CACHE = None
+
+    assert all(m.startswith("gemini/") for m in picked), picked
+    assert picked[0] == "gemini/models/gemini-2.5-pro", "the capable model should lead"
+    assert "lite" not in picked[0]
+
+
+def test_a_gemini_prefixed_model_routes_to_gemini_with_the_bare_name(monkeypatch):
+    """The prefix picks the provider; the provider gets the name it understands.
+
+    Google's catalogue returns ids as "models/gemini-2.5-pro" but its
+    OpenAI-compatible endpoint is documented with the bare name, so both the
+    routing prefix and the catalogue namespace come off.
+    """
+    import bot.llm as llm
+
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    prov, bare = llm._provider_for("gemini/models/gemini-2.5-pro")
+    assert prov.name == "gemini"
+    assert bare == "gemini-2.5-pro"
+
+
+def test_a_bare_provider_name_is_passed_through_untouched(monkeypatch):
+    """Groq ids have no namespace at all; nothing may be stripped off them."""
+    import bot.llm as llm
+
+    monkeypatch.setenv("GROQ_API_KEY", "x")
+    prov, bare = llm._provider_for("groq/llama-3.3-70b-versatile")
+    assert prov.name == "groq"
+    assert bare == "llama-3.3-70b-versatile"
+
+
+def test_openrouter_keeps_its_vendor_prefix_in_the_call(monkeypatch):
+    import bot.llm as llm
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    prov, bare = llm._provider_for("openrouter/openai/gpt-6-astra")
+    assert prov.name == "openrouter"
+    assert bare == "openai/gpt-6-astra"

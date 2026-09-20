@@ -68,7 +68,12 @@ MODEL_PREFERENCES: list[tuple[str, int]] = [
     (r"^google/gemini", 50),
 ]
 
-EXCLUDE = re.compile(r"(:free|:online|-preview|audio|image|tts|embed|moderation|search)", re.I)
+# Any ":suffix" on an OpenRouter id is a routing variant, not a different
+# model. The live catalogue handed back "openai/gpt-6-astra:batch", and batch
+# routing can take hours to return, against a question window of three. Reject
+# every variant rather than blocklisting them one at a time.
+VARIANT = re.compile(r":")
+EXCLUDE = re.compile(r"(-preview|audio|image|tts|embed|moderation|search)", re.I)
 
 # Fallback if the catalogue cannot be read. Deliberately family-diverse.
 STATIC_FALLBACK = ["openai/gpt-5", "anthropic/claude-sonnet-4", "google/gemini-2.5-pro"]
@@ -142,7 +147,10 @@ def _adapt_model_name(prov: Provider, model: str) -> str:
 
     Sending "openai/gpt-5" to the Metaculus proxy produced
     "You don\'t have an allowance for model <openai/gpt-5> on <Openai>", because
-    the vendor prefix is part of the name it looks up.
+    the vendor prefix is part of the name it looks up. The same single-segment
+    strip also turns Google's catalogue form "models/gemini-2.5-pro" into the
+    "gemini-2.5-pro" its OpenAI-compatible endpoint is documented with, and
+    leaves a bare Groq id such as "llama-3.3-70b-versatile" untouched.
     """
     if prov.name == "openrouter":
         return model
@@ -247,6 +255,50 @@ def chat_with_fallback(
 # -- model resolution ------------------------------------------------------
 _CATALOGUE_CACHE: list[dict] | None = None
 
+# Ranking for providers that are not OpenRouter, whose ids are bare names with
+# no vendor prefix for the patterns above to match.
+_BIGGER = re.compile(r"(pro\b|opus|ultra|120b|70b|72b|large)", re.I)
+_SMALLER = re.compile(r"(lite|mini|nano|tiny|small|\b[1-9]b\b|8b|instant)", re.I)
+
+
+def active_provider() -> Provider | None:
+    """Whichever provider this run can actually reach, in preference order."""
+    for name in ("openrouter", "gemini", "groq", "metaculus"):
+        if PROVIDERS[name].key:
+            return PROVIDERS[name]
+    return None
+
+
+def provider_catalogue(prov: Provider) -> list[str]:
+    """Ask a provider which models it serves. Empty list if it will not say."""
+    headers = {"Authorization": f"{prov.auth_scheme} {prov.key}"} if prov.key else {}
+    try:
+        resp = requests.get(f"{prov.base_url}/models", headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not list %s models: %s", prov.name, str(exc)[:200])
+        return []
+    entries = data.get("data") if isinstance(data, dict) else data
+    out = []
+    for entry in entries or []:
+        mid = entry.get("id") if isinstance(entry, dict) else entry
+        if mid and not EXCLUDE.search(str(mid)):
+            out.append(str(mid))
+    return out
+
+
+def _rank_bare(ids: Sequence[str]) -> list[str]:
+    def score(mid: str) -> tuple[int, str]:
+        rank = 0
+        if _BIGGER.search(mid):
+            rank -= 2
+        if _SMALLER.search(mid):
+            rank += 1
+        return (rank, mid)
+
+    return sorted(ids, key=score)
+
 
 def _catalogue() -> list[dict]:
     global _CATALOGUE_CACHE
@@ -282,6 +334,16 @@ def resolve_models(count: int = 3) -> list[str]:
     if override:
         return [m.strip() for m in override.split(",") if m.strip()]
 
+    prov = active_provider()
+    if prov is not None and prov.name != "openrouter":
+        # No OpenRouter key, so the ensemble comes from whichever provider we
+        # do have. Ask it what it serves; hardcoding names is what produced
+        # "You don\'t have an allowance for model <openai/gpt-5>".
+        served = _rank_bare(provider_catalogue(prov))
+        if served:
+            return [f"{prov.name}/{mid}" for mid in served[:count]]
+        log.warning("%s served no model list; falling back", prov.name)
+
     catalogue = _catalogue()
     if not catalogue:
         return STATIC_FALLBACK[:count] if count <= len(STATIC_FALLBACK) else STATIC_FALLBACK
@@ -289,7 +351,7 @@ def resolve_models(count: int = 3) -> list[str]:
     scored: list[tuple[int, int, str, str]] = []
     for entry in catalogue:
         mid = entry.get("id") or ""
-        if EXCLUDE.search(mid):
+        if VARIANT.search(mid) or EXCLUDE.search(mid):
             continue
         for pattern, score in MODEL_PREFERENCES:
             if re.search(pattern, mid):
