@@ -20,6 +20,7 @@ from .llm import (
     NoModelsAvailable,
     chat_with_fallback,
     extract_json,
+    provider_is_metered,
     run_parallel,
 )
 from .scaling import Scaling
@@ -136,6 +137,11 @@ def _num_label(v: float) -> str:
 # -- research --------------------------------------------------------------
 def search_queries(ctx: dict, models: Sequence[str]) -> list[str]:
     fallback = [ctx["title"][:200]]
+    if provider_is_metered():
+        # One model call per question spent on phrasing search terms is a
+        # luxury when the budget is measured in calls per minute. The title is
+        # a decent query on its own.
+        return fallback
     try:
         text, _ = chat_with_fallback(
             prompts.search_queries_prompt(ctx), models, temperature=0.3, max_tokens=300

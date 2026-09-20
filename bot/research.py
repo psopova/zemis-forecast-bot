@@ -116,6 +116,21 @@ def asknews(query: str, report: ResearchReport, n: int = 8) -> None:
         report.errors.append(f"asknews: {exc}")
 
 
+_GDELT_STOP = {"the", "and", "for", "will", "any", "are", "was", "has", "had", "its", "this", "that", "with", "from", "before", "after", "than", "these", "their", "what", "which", "does"}
+
+
+def gdelt_query(text: str) -> str:
+    """GDELT has its own query grammar and rejects most natural phrasing.
+
+    Live failures were "Parentheses may only be used around OR'd statements"
+    and "Your search contained a keyword that was too short", both from passing
+    a question title through unchanged. Reduce it to plain keywords.
+    """
+    words = re.findall(r"[A-Za-z0-9]+", text or "")
+    keep = [w for w in words if len(w) >= 3 and w.lower() not in _GDELT_STOP]
+    return " ".join(keep[:8])
+
+
 def gdelt(query: str, report: ResearchReport, n: int = 8, days: int = 21) -> None:
     """GDELT's document API is public and keyless, but it rate-limits hard.
 
@@ -124,6 +139,9 @@ def gdelt(query: str, report: ResearchReport, n: int = 8, days: int = 21) -> Non
     long one is not, because the question closes in three hours and every other
     source is still available.
     """
+    query = gdelt_query(query)
+    if len(query.split()) < 2:
+        return
     try:
         params = {
             "query": query,

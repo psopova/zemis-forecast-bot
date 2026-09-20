@@ -179,7 +179,7 @@ def test_resolution_follows_the_provider_that_has_a_key(monkeypatch):
                 "data": [
                     {"id": "models/gemini-2.5-flash-lite"},
                     {"id": "models/gemini-2.5-pro"},
-                    {"id": "models/gemini-2.5-flash"},
+                    {"id": "models/gemini-3-flash"},
                 ]
             }
         )
@@ -192,8 +192,55 @@ def test_resolution_follows_the_provider_that_has_a_key(monkeypatch):
         llm._CATALOGUE_CACHE = None
 
     assert all(m.startswith("gemini/") for m in picked), picked
-    assert picked[0] == "gemini/models/gemini-2.5-pro", "the capable model should lead"
+    assert picked[0] == "gemini/models/gemini-3-flash", picked
     assert "lite" not in picked[0]
+
+
+def test_model_ranking_matches_what_the_live_run_taught_us(monkeypatch):
+    """The first live Gemini run picked three models and all three failed.
+
+    models/aqa is not a chat endpoint and returned 404. gemini-2.5-pro is
+    closed to new keys and returned 404. gemini-pro-latest returned 429 on
+    every attempt because the pro class per-minute limit on a free key cannot
+    feed an ensemble. Flash answers; capability it cannot deliver is worth
+    nothing.
+    """
+    from bot.llm import _rank_bare
+
+    live = [
+        "models/gemini-2.5-pro",
+        "models/gemini-pro-latest",
+        "models/aqa",
+        "models/embedding-001",
+        "models/imagen-4",
+        "models/veo-3",
+        "models/gemini-3-flash",
+        "models/gemini-3-flash-lite",
+        "models/gemini-2.5-flash",
+    ]
+    ranked = _rank_bare(live)
+
+    for junk in ("models/aqa", "models/embedding-001", "models/imagen-4", "models/veo-3"):
+        assert junk not in ranked, junk
+    assert ranked[0] == "models/gemini-3-flash"
+    assert ranked.index("models/gemini-3-flash") < ranked.index("models/gemini-3-pro") if "models/gemini-3-pro" in ranked else True
+    assert ranked.index("models/gemini-2.5-flash") < ranked.index("models/gemini-2.5-pro")
+    assert ranked.index("models/gemini-3-flash") < ranked.index("models/gemini-2.5-flash"), "newest first"
+
+
+def test_the_rate_limiter_spaces_requests(monkeypatch):
+    """Fifteen simultaneous requests at a free key produced four minutes of 429s."""
+    import time as _time
+
+    from bot.llm import PROVIDER_LIMITS, _RateLimiter
+
+    limiter = _RateLimiter()
+    PROVIDER_LIMITS.setdefault("fake", (60.0, 1))
+    started = _time.monotonic()
+    for _ in range(3):
+        limiter.wait("fake")
+    elapsed = _time.monotonic() - started
+    assert elapsed >= 1.8, f"three calls at 60/min should take about 2s, took {elapsed:.2f}s"
 
 
 def test_a_gemini_prefixed_model_routes_to_gemini_with_the_bare_name(monkeypatch):

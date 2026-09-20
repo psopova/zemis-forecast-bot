@@ -24,7 +24,15 @@ from datetime import datetime, timezone
 from . import config, research as research_mod
 from .client import MetaculusClient, MetaculusError, already_forecast, sub_questions
 from .forecast import CONTINUOUS_TYPES, build_context, forecast_question, search_queries
-from .llm import DEAD_MODELS, USAGE, LLMError, NoModelsAvailable, metaculus_proxy_models, resolve_models
+from .llm import (
+    DEAD_MODELS,
+    USAGE,
+    LLMError,
+    NoModelsAvailable,
+    metaculus_proxy_models,
+    provider_is_metered,
+    resolve_models,
+)
 
 log = logging.getLogger("bot")
 
@@ -200,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     models = resolve_models(config.ENSEMBLE_MODELS)
+    runs = args.runs
+    if provider_is_metered() and runs == config.RUNS_PER_QUESTION:
+        runs = config.RUNS_PER_QUESTION_METERED
+        log.info("provider is rate limited, using %d runs per question", runs)
     log.info("ensemble: %s", ", ".join(models))
 
     deadline = time.monotonic() + args.watch if args.watch else None
@@ -207,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         started = time.monotonic()
         try:
-            total += run_tick(client, tournaments, models, args.runs, args.limit)
+            total += run_tick(client, tournaments, models, runs, args.limit)
         except Exception:  # noqa: BLE001 - a watch loop must outlive one bad tick
             log.error("tick crashed:\n%s", traceback.format_exc()[:2000])
 

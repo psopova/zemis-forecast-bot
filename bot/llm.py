@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
+import threading
+
 import requests
 
 log = logging.getLogger(__name__)
@@ -77,6 +79,47 @@ EXCLUDE = re.compile(r"(-preview|audio|image|tts|embed|moderation|search)", re.I
 
 # Fallback if the catalogue cannot be read. Deliberately family-diverse.
 STATIC_FALLBACK = ["openai/gpt-5", "anthropic/claude-sonnet-4", "google/gemini-2.5-pro"]
+
+
+# Requests per minute and maximum concurrency per provider. The first live run
+# fired fifteen requests at once at a free Gemini key and got nothing but 429s
+# for four minutes. Sending fewer requests is what makes them succeed.
+PROVIDER_LIMITS: dict[str, tuple[float, int]] = {
+    "openrouter": (120.0, 6),
+    "gemini": (10.0, 2),
+    "groq": (25.0, 3),
+    "metaculus": (20.0, 2),
+}
+
+
+class _RateLimiter:
+    """A minimum spacing plus a concurrency cap, per provider."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_free: dict[str, float] = {}
+        self._slots: dict[str, threading.Semaphore] = {}
+
+    def slot(self, name: str) -> threading.Semaphore:
+        with self._lock:
+            if name not in self._slots:
+                _, concurrency = PROVIDER_LIMITS.get(name, (60.0, 4))
+                self._slots[name] = threading.Semaphore(concurrency)
+            return self._slots[name]
+
+    def wait(self, name: str) -> None:
+        rpm, _ = PROVIDER_LIMITS.get(name, (60.0, 4))
+        spacing = 60.0 / max(rpm, 1.0)
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next_free.get(name, 0.0))
+            self._next_free[name] = start + spacing
+        delay = start - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+
+LIMITER = _RateLimiter()
 
 
 class LLMError(RuntimeError):
@@ -186,19 +229,36 @@ def chat(
 
     last = None
     for attempt in range(1, attempts + 1):
-        try:
-            resp = requests.post(
-                f"{prov.base_url}/chat/completions",
-                headers=headers,
-                json=body,
-                timeout=timeout,
-            )
-        except requests.RequestException as exc:
-            last = f"{type(exc).__name__}: {exc}"
-            time.sleep(min(2 ** attempt, 30))
+        with LIMITER.slot(prov.name):
+            LIMITER.wait(prov.name)
+            try:
+                resp = requests.post(
+                    f"{prov.base_url}/chat/completions",
+                    headers=headers,
+                    json=body,
+                    timeout=timeout,
+                )
+            except requests.RequestException as exc:
+                last = f"{type(exc).__name__}: {exc}"
+                time.sleep(min(2 ** attempt, 30))
+                continue
+
+        if resp.status_code == 429:
+            # Free tiers count per minute, so a few seconds of backoff just
+            # spends another request against the same exhausted window.
+            retry_after = resp.headers.get("Retry-After")
+            delay = 30.0 * attempt
+            if retry_after:
+                try:
+                    delay = max(float(retry_after), 5.0)
+                except ValueError:
+                    pass
+            last = f"HTTP 429, waited {delay:.0f}s"
+            log.info("%s rate limited, sleeping %.0fs", prov.name, delay)
+            time.sleep(min(delay, 90.0))
             continue
 
-        if resp.status_code in (429, 500, 502, 503, 504):
+        if resp.status_code in (500, 502, 503, 504):
             last = f"HTTP {resp.status_code}"
             time.sleep(min(2 ** attempt, 30))
             continue
@@ -255,10 +315,21 @@ def chat_with_fallback(
 # -- model resolution ------------------------------------------------------
 _CATALOGUE_CACHE: list[dict] | None = None
 
-# Ranking for providers that are not OpenRouter, whose ids are bare names with
-# no vendor prefix for the patterns above to match.
-_BIGGER = re.compile(r"(pro\b|opus|ultra|120b|70b|72b|large)", re.I)
-_SMALLER = re.compile(r"(lite|mini|nano|tiny|small|\b[1-9]b\b|8b|instant)", re.I)
+# Not every id a provider lists is a chat model. The first live run picked
+# "models/aqa", which is an attributed-question-answering endpoint and returns
+# 404 for generateContent, and "gemini-2.5-pro", which Google has closed to new
+# keys. Both cost a whole run.
+_NOT_A_CHAT_MODEL = re.compile(
+    r"(aqa|embed|imagen|veo|image-gen|^models/text-|tts|speech|audio|live|vision-only|learnlm)",
+    re.I,
+)
+
+# On a free tier the flash class is what actually answers: the pro class has a
+# per-minute limit low enough that a five member ensemble exhausts it on the
+# first question. Capability is worth less than a reply.
+_FLASH = re.compile(r"flash", re.I)
+_LITE = re.compile(r"(lite|mini|nano|tiny|8b|instant)", re.I)
+_VERSION = re.compile(r"(\d+(?:\.\d+)?)")
 
 
 def active_provider() -> Provider | None:
@@ -289,15 +360,17 @@ def provider_catalogue(prov: Provider) -> list[str]:
 
 
 def _rank_bare(ids: Sequence[str]) -> list[str]:
-    def score(mid: str) -> tuple[int, str]:
-        rank = 0
-        if _BIGGER.search(mid):
-            rank -= 2
-        if _SMALLER.search(mid):
-            rank += 1
-        return (rank, mid)
+    """Order a provider's own model ids: answerable first, newest first."""
 
-    return sorted(ids, key=score)
+    def score(mid: str) -> tuple[float, float, str]:
+        tier = 0.0 if _FLASH.search(mid) else 1.0
+        if _LITE.search(mid):
+            tier += 0.5
+        versions = [float(v) for v in _VERSION.findall(mid)] or [0.0]
+        return (tier, -max(versions), mid)
+
+    usable = [m for m in ids if not _NOT_A_CHAT_MODEL.search(m)]
+    return sorted(usable, key=score)
 
 
 def _catalogue() -> list[dict]:
@@ -459,3 +532,12 @@ def metaculus_proxy_models() -> list[str]:
         if mid:
             out.append(str(mid))
     return sorted(out)
+
+
+def provider_is_metered(threshold: float = 30.0) -> bool:
+    """True when the run is on a low rate limit and should spend calls sparingly."""
+    prov = active_provider()
+    if prov is None:
+        return True
+    rpm, _ = PROVIDER_LIMITS.get(prov.name, (60.0, 4))
+    return rpm < threshold
