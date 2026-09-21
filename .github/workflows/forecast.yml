@@ -15,13 +15,17 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: forecast-watcher
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 250
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,4 +44,5 @@ jobs:
         run: |
           python -m bot.runner \
             --mode "${{ inputs.mode || 'tournament' }}" \
+            ${{ github.event_name == 'schedule' && '--watch 14400 --interval 240' || '' }} \
             ${{ inputs.dry_run && '--dry-run' || '' }}
