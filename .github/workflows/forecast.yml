@@ -55,6 +55,26 @@ jobs:
       - run: pip install -r requirements.txt
       - name: note when this watcher started
         run: echo "WATCH_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+      - name: check the handover token before spending five hours
+        # The handover runs at the far end of the window. A broken or missing
+        # WATCHER_PAT would therefore announce itself five and a half hours
+        # after the mistake, by which point coverage has already stopped. One
+        # API call at the start turns that into a warning in the first minute.
+        if: ${{ github.event_name == 'schedule' || inputs.watch }}
+        env:
+          GH_TOKEN: ${{ secrets.WATCHER_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::WATCHER_PAT is empty. This watcher will run, but nothing will start the next one."
+            exit 0
+          fi
+          if gh run list --workflow forecast.yml --limit 1 >/dev/null 2>&1; then
+            echo "handover token works; this watcher can start its replacement"
+          else
+            echo "::warning::WATCHER_PAT is set but cannot read this repository's runs. It probably needs Actions: read and write."
+          fi
       - name: forecast
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
