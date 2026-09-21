@@ -101,3 +101,55 @@ def test_a_working_gdelt_still_returns_evidence(monkeypatch):
     research.gdelt("Trump net approval rating December 2026", report)
     assert not report.errors
     assert any("Approval rating slips again" in e.title for e in report.items)
+
+
+# -- prediction markets ----------------------------------------------------
+# 34% of prize winners looked up related markets or resolved questions against
+# 0% of non-winners (p = 0.04), and it ranked second of 33 features the next
+# season. It is the strongest free signal published, so it has to actually run.
+
+
+def test_manifold_asks_only_for_markets_that_carry_a_probability(monkeypatch):
+    seen = {}
+
+    def fake_get(url, params=None, **kwargs):
+        seen.update(params or {})
+        return FakeResponse(200, [])
+
+    monkeypatch.setattr(research.requests, "get", fake_get)
+    research.manifold("will the shutdown end", ResearchReport())
+    # Perpetual and multi-outcome markets have no "probability" and get
+    # dropped, so without this filter a query can spend every slot and return
+    # nothing while looking perfectly healthy.
+    assert seen.get("contractType") == "BINARY"
+    assert seen.get("filter") == "open"
+
+
+def test_a_market_price_arrives_as_weighable_evidence(monkeypatch):
+    payload = [
+        {
+            "question": "US government shutdown on October 1st 2026?",
+            "probability": 0.0384,
+            "volume": 8544,
+            "closeTime": 1790812740000,
+            "url": "https://manifold.markets/x/y",
+        }
+    ]
+    monkeypatch.setattr(research.requests, "get", lambda url, **kw: FakeResponse(200, payload))
+    report = ResearchReport()
+    research.manifold("government shutdown", report)
+    assert not report.errors
+    item = report.items[0]
+    assert item.source == "Manifold"
+    assert "4%" in item.detail, item.detail
+    assert "8544" in item.detail, "volume is how the model tells a real price from a thin one"
+
+
+def test_the_evidence_mix_is_reportable(monkeypatch):
+    report = ResearchReport()
+    report.add(research.Evidence(source="Manifold", title="a", detail=""))
+    report.add(research.Evidence(source="Manifold", title="b", detail=""))
+    report.add(research.Evidence(source="GDELT", title="c", detail=""))
+    # A source that quietly returns nothing looks identical to one that works.
+    assert report.source_mix == "GDELT 1, Manifold 2"
+    assert ResearchReport().source_mix == "nothing"

@@ -121,6 +121,7 @@ def handle_one(client: MetaculusClient, post: dict, question: dict, models: list
 
     queries = search_queries(ctx, models)
     report = research_mod.gather(queries)
+    log.info("q%s evidence: %s", qid, report.source_mix)
     if report.errors:
         log.warning("q%s research issues: %s", qid, "; ".join(report.errors)[:300])
 

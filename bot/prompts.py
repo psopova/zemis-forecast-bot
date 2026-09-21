@@ -46,6 +46,19 @@ _GUARDS = """Two things about how this question works, which are the most expens
 * A question of the form "will X happen before <date>" covers the whole window from now until that date. It has not resolved No merely because X has not happened yet, and it has not resolved Yes merely because something resembling X happened before the question opened."""
 
 
+# Looking up related markets is the single strongest free signal in the
+# published surveys: 34% of winners did it against 0% of non-winners (p = 0.04),
+# and it ranked second of 33 features the following season (r = +0.34).
+#
+# But the same data warns against leaning on it. One bot maker blended crowd
+# predictions mechanically and fell from 20th to 63rd, and within the winner
+# cohort more community-checking correlates with a LOWER score. So the prices
+# go in as evidence to be weighed, never as an answer to copy.
+_MARKET_NOTE = """About the [Manifold] and [Polymarket] lines above: those are live prices on OTHER questions that a keyword search thought were related. They are not this question.
+
+Check the wording and the dates before you use one. A liquid market (high volume, many traders) asking almost exactly this question is strong evidence and should move you a long way. A thin market, or one whose wording or deadline differs, is weak and may be about something else entirely. Do not copy a price across a difference you have not checked, and do not average yourself with a market just to feel safe."""
+
+
 def _header(ctx: dict) -> str:
     now = datetime.now(timezone.utc)
     parts = [
@@ -69,6 +82,8 @@ def _body(ctx: dict, research: str) -> str:
     if ctx.get("fine_print"):
         chunks.append(f"Fine print:\n{ctx['fine_print']}")
     chunks.append(f"Evidence gathered today:\n{research}")
+    if "[Manifold]" in research or "[Polymarket]" in research:
+        chunks.append(_MARKET_NOTE)
     return "\n\n".join(chunks)
 
 

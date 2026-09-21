@@ -72,6 +72,21 @@ class ResearchReport:
     def source_names(self) -> list[str]:
         return sorted({item.source for item in self.items})
 
+    @property
+    def source_mix(self) -> str:
+        """What each source actually contributed, for the log.
+
+        A source that silently returns nothing looks exactly like a source that
+        is working, which is how a feature stays switched off for a season
+        without anyone noticing.
+        """
+        counts: dict[str, int] = {}
+        for item in self.items:
+            counts[item.source] = counts.get(item.source, 0) + 1
+        if not counts:
+            return "nothing"
+        return ", ".join(f"{name} {n}" for name, n in sorted(counts.items()))
+
 
 def _clean(text: str, limit: int = 600) -> str:
     text = html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
@@ -243,7 +258,17 @@ def manifold(query: str, report: ResearchReport, n: int = 4) -> None:
     try:
         resp = requests.get(
             "https://api.manifold.markets/v0/search-markets",
-            params={"term": query, "limit": n, "filter": "open", "sort": "score"},
+            # Without contractType the search returns perpetual and multi
+            # outcome markets, which carry no "probability" field and are
+            # dropped below, so a query can spend all four slots and return
+            # nothing. Ask only for the kind that answers the question.
+            params={
+                "term": query,
+                "limit": n,
+                "filter": "open",
+                "sort": "score",
+                "contractType": "BINARY",
+            },
             headers=UA,
             timeout=TIMEOUT,
         )
