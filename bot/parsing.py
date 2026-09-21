@@ -26,7 +26,9 @@ _MULTIPLIERS = {
     "trillion": 1e12,
 }
 
-_NUM = r"[-+]?\d[\d,_\s]*(?:\.\d+)?(?:[eE][-+]?\d+)?"
+# A leading dot is allowed because models write ".5" as readily as "0.5", and a
+# probability that fails to parse costs the whole ensemble member.
+_NUM = r"[-+]?(?:\d[\d,_\s]*(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?"
 
 
 def parse_number(raw: str) -> float | None:
@@ -59,28 +61,40 @@ def parse_number(raw: str) -> float | None:
 
 
 def parse_probability(text: str) -> float | None:
-    """Find the final stated probability, as a fraction in (0, 1)."""
+    """Find the final stated probability, as a fraction in (0, 1).
+
+    The percent sign decides the scale, and it has to, because a bare 1 is
+    ambiguous between one percent and certainty. Reading "PROBABILITY: 1%" as
+    1.0 turned a model saying "almost certainly not" into a submitted 95% yes.
+    On a log scoring rule that single confusion is worth roughly six hundred
+    peer points in the wrong direction, so the rule is explicit: a percent sign
+    always means percent, a bare value below one is already a fraction, and a
+    bare value from one to a hundred is a percentage, which is the form the
+    prompt asks for.
+    """
     if not text:
         return None
     patterns = [
-        r"PROBABILITY\s*[:=]\s*\**\s*(" + _NUM + r")\s*%?",
-        r"probability\s*(?:is|of)?\s*[:=]?\s*\**\s*(" + _NUM + r")\s*%",
-        r"\bP\s*\(\s*yes\s*\)\s*[:=]\s*(" + _NUM + r")",
+        r"PROBABILITY\s*[:=]\s*\**\s*(" + _NUM + r")\s*(%?)",
+        r"probability\s*(?:is|of)?\s*[:=]?\s*\**\s*(" + _NUM + r")\s*(%)",
+        r"\bP\s*\(\s*yes\s*\)\s*[:=]\s*(" + _NUM + r")\s*(%?)",
     ]
     for pattern in patterns:
         matches = re.findall(pattern, text, flags=re.I)
         if not matches:
             continue
-        value = parse_number(matches[-1])
+        raw, percent_sign = matches[-1]
+        value = parse_number(raw)
         if value is None:
             continue
-        # "37" and "37%" both mean 0.37; "0.37" means 0.37.
-        if value > 1.0:
+        if percent_sign:
             value /= 100.0
+        elif value >= 1.0:
+            value /= 100.0
+        if value <= 0.0 or value >= 1.0:
+            value = min(max(value, 0.001), 0.999)
         if 0.0 < value < 1.0:
             return value
-        if value in (0.0, 1.0):
-            return min(max(value, 0.001), 0.999)
     return None
 
 

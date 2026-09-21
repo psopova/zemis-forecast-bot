@@ -137,3 +137,38 @@ def test_parse_multiple_choice_with_bullets_and_bold():
 def test_parse_multiple_choice_gives_up_cleanly():
     assert parse_multiple_choice("nothing useful", ["A", "B"]) is None
     assert parse_multiple_choice("", ["A"]) is None
+
+
+# --------------------------------------------------------------------------
+# From the first run that produced real forecasts. "PROBABILITY: 1%" was read
+# as certainty and submitted as a 95% yes on a question whose true answer is
+# close to zero. The percent sign has to decide the scale.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("PROBABILITY: 1%", 0.01),
+        ("PROBABILITY: 2%", 0.02),
+        ("PROBABILITY: 0.5%", 0.005),
+        ("PROBABILITY: 99%", 0.99),
+        ("PROBABILITY: 1", 0.01),
+        ("PROBABILITY: 99", 0.99),
+        ("PROBABILITY: 0.02", 0.02),
+        ("PROBABILITY: .5", 0.5),
+        ("probability: 0.02", 0.02),
+        ("P(yes) = 0.9", 0.9),
+        ("P(yes) = 1%", 0.01),
+    ],
+)
+def test_percent_sign_decides_the_scale(text, expected):
+    assert parse_probability(text) == pytest.approx(expected)
+
+
+def test_a_confident_no_never_becomes_a_confident_yes():
+    """The regression that matters: low stated probability stays low."""
+    from bot.aggregate import calibrate_binary
+
+    for text in ("PROBABILITY: 1%", "PROBABILITY: 0%", "PROBABILITY: 2%", "PROBABILITY: 1"):
+        p = parse_probability(text)
+        assert p is not None and p < 0.05, (text, p)
+        assert calibrate_binary(p) < 0.5, (text, calibrate_binary(p))

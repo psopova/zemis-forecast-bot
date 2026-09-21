@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from . import aggregate, parsing, prompts
-from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, build_cdf, safe_cdf
+from .cdf import DEFAULT_INBOUND_OUTCOME_COUNT, build_cdf, percentiles_from_cdf, safe_cdf
 from .llm import (
     LLMError,
     NoModelsAvailable,
@@ -266,12 +266,14 @@ def forecast_numeric(ctx: dict, research: str, models: Sequence[str], runs: int)
     def fmt(v: float) -> str:
         return _epoch_label(v) if is_date else _num_label(v)
 
-    lookup = dict(widened)
-    median = lookup.get(0.5) or lookup.get(0.4) or list(lookup.values())[len(lookup) // 2]
-    low = min(v for _, v in widened)
-    high = max(v for _, v in widened)
-    notes.append(f"{len(parsed_runs)} usable runs; merged median {fmt(median)}")
-    headline = f"median {fmt(median)} (range {fmt(low)} to {fmt(high)})"
+    # Report what was actually submitted, not the raw anchors. The anchors
+    # include tail extensions that can sit outside the question's range and get
+    # conditioned away when the CDF is built, which made an early run look far
+    # wider than the distribution really was.
+    read = percentiles_from_cdf(cdf, scaling, (0.05, 0.5, 0.95))
+    median = read[0.5]
+    notes.append(f"{len(parsed_runs)} usable runs; submitted median {fmt(median)}")
+    headline = f"median {fmt(median)} (90% between {fmt(read[0.05])} and {fmt(read[0.95])})"
     return (
         {"question": ctx["question_id"], "continuous_cdf": cdf},
         headline,
