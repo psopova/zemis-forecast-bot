@@ -83,6 +83,9 @@ jobs:
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Repository variable, so reasoning effort can be turned down
+          # without a deploy if it starts costing coverage. Empty means high.
+          BOT_REASONING: ${{ vars.BOT_REASONING }}
         run: |
           python -m bot.runner \
             --mode "${{ inputs.mode || 'tournament' }}" \
