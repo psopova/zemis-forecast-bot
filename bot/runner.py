@@ -22,7 +22,13 @@ import traceback
 from datetime import datetime, timezone
 
 from . import config, research as research_mod
-from .client import MetaculusClient, MetaculusError, already_forecast, sub_questions
+from .client import (
+    MetaculusClient,
+    MetaculusError,
+    MissingForecastHistory,
+    already_forecast,
+    sub_questions,
+)
 from .forecast import CONTINUOUS_TYPES, build_context, forecast_question, search_queries
 from .llm import (
     DEAD_MODELS,
@@ -48,6 +54,39 @@ def setup_logging(verbose: bool = False) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
+def _seen_before(client: MetaculusClient, post: dict, question: dict) -> bool:
+    """Has the bot already forecast this question, according to the server?
+
+    The list endpoint only carries my_forecasts when it was asked for it. If it
+    is missing anyway, fall back to the post detail, which always carries it.
+
+    If neither can answer, forecast it. The tournament asks for one forecast
+    per question, but spot peer scoring counts only the last forecast, so a
+    second one costs nothing in points, while a question never forecast scores
+    zero under a prize rule proportional to the square of the total. The error
+    is logged loudly because a run full of these means the with_cp parameter
+    has regressed again.
+    """
+    try:
+        return already_forecast(question)
+    except MissingForecastHistory as exc:
+        log.error("%s", exc)
+    try:
+        detail = client.get_post(post.get("id"))
+    except MetaculusError as exc:
+        log.error("could not re-check post %s: %s", post.get("id"), exc)
+        return False
+    for candidate in sub_questions(detail or {}):
+        if candidate.get("id") == question.get("id"):
+            try:
+                return already_forecast(candidate)
+            except MissingForecastHistory:
+                break
+    log.error("post %s detail could not say whether q%s was forecast; forecasting it",
+              post.get("id"), question.get("id"))
+    return False
+
+
 def collect_targets(client: MetaculusClient, tournaments: list[str]) -> list[tuple[dict, dict]]:
     """Open questions in these tournaments that the bot has not forecast yet."""
     targets: list[tuple[dict, dict]] = []
@@ -69,7 +108,7 @@ def collect_targets(client: MetaculusClient, tournaments: list[str]) -> list[tup
                 if qtype not in SUPPORTED:
                     log.info("skipping question %s: unsupported type %r", qid, qtype)
                     continue
-                if already_forecast(question):
+                if _seen_before(client, post, question):
                     continue
                 targets.append((post, question))
     return targets

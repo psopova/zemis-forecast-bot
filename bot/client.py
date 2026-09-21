@@ -31,6 +31,10 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 5
 
 
+class MissingForecastHistory(RuntimeError):
+    """The response carried no my_forecasts, so "already forecast?" is unanswerable."""
+
+
 class MetaculusError(RuntimeError):
     pass
 
@@ -132,6 +136,12 @@ class MetaculusClient:
                 ("statuses", statuses),
                 ("include_descriptions", "true"),
                 ("order_by", "open_time"),
+                # Without with_cp the server never attaches my_forecasts, and
+                # already_forecast() then answers "no" for every question, so
+                # the bot re-forecasts everything it has already done. The
+                # tournament rules ask for one forecast per question, so this
+                # parameter is load bearing, not a nicety.
+                ("with_cp", "true"),
             ]
             data = self._request("GET", f"/posts/?{urlencode(params)}")
             results = (data or {}).get("results") or []
@@ -193,9 +203,28 @@ def sub_questions(post: dict) -> list[dict]:
 
 
 def already_forecast(question: dict) -> bool:
+    """Has this bot already submitted a forecast on this question?
+
+    The tournament asks for one forecast per question, and the source of truth
+    is the server rather than anything this process remembers: a watcher is
+    restarted many times inside a question's three hour window.
+
+    ``my_forecasts`` is only present when the request asked for with_cp. If the
+    key is missing entirely the caller is asking a question the response cannot
+    answer, and answering "no" would silently re-forecast the whole tournament,
+    so say so instead of guessing.
+    """
+    if "my_forecasts" not in question:
+        raise MissingForecastHistory(
+            f"question {question.get('id')} came back without my_forecasts; "
+            "the request needs with_cp=true"
+        )
     mine = question.get("my_forecasts") or {}
+    if mine.get("history"):
+        return True
     latest = mine.get("latest") or {}
-    if not latest:
-        return False
-    # A withdrawn forecast has an end_time in the past; treat it as absent.
-    return bool(latest.get("forecast_values") or latest.get("continuous_cdf") or latest.get("probability_yes") is not None)
+    return bool(
+        latest.get("forecast_values")
+        or latest.get("continuous_cdf")
+        or latest.get("probability_yes") is not None
+    )
