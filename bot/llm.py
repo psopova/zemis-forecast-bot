@@ -92,6 +92,43 @@ PROVIDER_LIMITS: dict[str, tuple[float, int]] = {
 }
 
 
+# The strongest controlled result Metaculus has published: eight pairs of bots
+# differing only in reasoning effort, and the higher-effort one won all eight
+# (one-sided sign test p = 0.004). Their example pair scored 11.3 against 4.56
+# peer points per question. Nothing else in their Spring 2026 analysis reached
+# significance, so this is the first thing to turn on and the last to turn off.
+#
+# BOT_REASONING=off disables it.
+REASONING_EFFORT = (os.environ.get("BOT_REASONING") or "high").strip().lower()
+
+# Thinking tokens are billed against the output budget, so a model that thinks
+# hard inside a 3000 token ceiling can spend the whole allowance reasoning and
+# return an empty answer. That is worse than not thinking at all: it turns a
+# good forecast into a parse failure.
+REASONING_MAX_TOKENS = 8000
+
+# Models that answered "I do not know that parameter", or that truncated with
+# reasoning on. Remembered for the process so one probe does not become one per
+# call.
+NO_REASONING: set[str] = set()
+
+_REASONING_REJECTED = re.compile(
+    r"(reasoning|thinking|effort|unknown (field|parameter)|unrecognized|not supported|invalid.*param)",
+    re.I,
+)
+
+
+def _reasoning_params(prov: "Provider", limit_key: str) -> dict:
+    """The provider's spelling of "think harder", or nothing."""
+    if REASONING_EFFORT in ("", "off", "none", "0", "false"):
+        return {}
+    if limit_key in NO_REASONING:
+        return {}
+    if prov.name == "openrouter":
+        return {"reasoning": {"effort": REASONING_EFFORT}}
+    return {"reasoning_effort": REASONING_EFFORT}
+
+
 class _RateLimiter:
     """A minimum spacing plus a concurrency cap, keyed by provider and model.
 
@@ -249,16 +286,20 @@ def chat(
     if prov.name == "openrouter":
         headers["X-Title"] = "metaculus-forecast-bot"
 
+    limit_key = f"{prov.name}|{bare_model}"
     body = {
         "model": bare_model,
         "messages": list(messages),
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    reasoning = _reasoning_params(prov, limit_key)
+    if reasoning:
+        body.update(reasoning)
+        body["max_tokens"] = max(max_tokens, REASONING_MAX_TOKENS)
 
     last = None
     for attempt in range(1, attempts + 1):
-        limit_key = f"{prov.name}|{bare_model}"
         with LIMITER.slot(limit_key):
             LIMITER.wait(limit_key)
             try:
@@ -289,6 +330,16 @@ def chat(
             time.sleep(min(2 ** attempt, 30))
             continue
         if resp.status_code in (400, 401, 403, 404):
+            # Do not bury a working model because it does not know one optional
+            # parameter. Drop the parameter, remember that, and try again.
+            if body.get("reasoning") or body.get("reasoning_effort"):
+                if resp.status_code == 400 and _REASONING_REJECTED.search(resp.text or ""):
+                    log.info("%s does not take a reasoning setting; dropping it", bare_model)
+                    NO_REASONING.add(limit_key)
+                    body.pop("reasoning", None)
+                    body.pop("reasoning_effort", None)
+                    body["max_tokens"] = max_tokens
+                    continue
             DEAD_MODELS.add(model)
             raise ModelUnavailable(
                 f"{prov.name} {bare_model} -> HTTP {resp.status_code}: {resp.text[:300]}"
@@ -298,9 +349,24 @@ def chat(
 
         data = resp.json()
         try:
-            text = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
         except (KeyError, IndexError, TypeError):
             raise LLMError(f"{prov.name} returned no content: {json.dumps(data)[:400]}")
+        if (
+            (body.get("reasoning") or body.get("reasoning_effort"))
+            and choice.get("finish_reason") == "length"
+            and not (text or "").strip()
+        ):
+            # It spent the whole output budget thinking. An empty answer scores
+            # nothing, so a shallower answer is strictly better.
+            log.info("%s ran out of output while thinking; retrying without it", bare_model)
+            NO_REASONING.add(limit_key)
+            body.pop("reasoning", None)
+            body.pop("reasoning_effort", None)
+            body["max_tokens"] = max_tokens
+            last = "truncated while reasoning"
+            continue
         cost = 0.0
         usage = data.get("usage") or {}
         if isinstance(usage.get("cost"), (int, float)):

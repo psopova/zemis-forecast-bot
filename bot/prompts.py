@@ -36,6 +36,16 @@ _COMMON_STEPS = """Work through these steps before answering:
 Weight the status quo heavily. Most questions resolve the boring way, and the world changes more slowly than news coverage suggests."""
 
 
+# Two failure modes that bot makers report as their single most expensive
+# questions of a season: one lost 90 peer points to the first, another said the
+# second was his worst question by a factor of two. Both are cheap to prevent
+# and neither is obvious to a model reading the question cold.
+_GUARDS = """Two things about how this question works, which are the most expensive mistakes available here:
+
+* It is open right now, which means it has NOT resolved yet. If the background or the evidence reads as though the thing already happened, assume you are looking at a similar past event, a proposal, a plan or somebody's forecast, not at resolution. Do not answer as though the outcome is settled unless the evidence is dated after today's date above and names this exact event.
+* A question of the form "will X happen before <date>" covers the whole window from now until that date. It has not resolved No merely because X has not happened yet, and it has not resolved Yes merely because something resembling X happened before the question opened."""
+
+
 def _header(ctx: dict) -> str:
     now = datetime.now(timezone.utc)
     parts = [
@@ -69,6 +79,8 @@ def binary_prompt(ctx: dict, research: str) -> list[dict]:
 
 {_COMMON_STEPS}
 
+{_GUARDS}
+
 Finish with exactly this line and nothing after it:
 PROBABILITY: X%
 
@@ -98,7 +110,9 @@ Units: {unit or 'as stated in the question'}
 {_COMMON_STEPS}
 (f) What an unexpectedly low outcome would look like, and an unexpectedly high one. Real distributions have fatter tails than they feel like they should.
 
-Then give your distribution as percentiles. Use plain numbers in the question's units, with no commas, currency symbols, percent signs or words.
+{_GUARDS}
+
+Then give your distribution as percentiles. Use plain numbers in the question's units, with no commas, currency symbols, percent signs or words. Report the value on the scale the units state: if the unit is millions, answer in millions, not in ones. A bot maker lost eighty peer points on a single question to that one mistake.
 
 Finish with exactly this block and nothing after it:
 PERCENTILES:
@@ -126,6 +140,8 @@ The options are:
 {listed}
 
 {_COMMON_STEPS}
+
+{_GUARDS}
 
 Leave real probability on options that look unlikely but are not impossible. Do not let any option fall below 1 percent unless it is genuinely ruled out by the resolution criteria.
 
