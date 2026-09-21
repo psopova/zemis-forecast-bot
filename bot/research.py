@@ -253,6 +253,92 @@ def wikipedia(query: str, report: ResearchReport, n: int = 2) -> None:
         report.errors.append(f"wikipedia: {exc}")
 
 
+# -- the page the question will be resolved from ---------------------------
+# Static web scraping was the highest scoring free feature in the Spring 2026
+# survey (r = +0.33, p = 0.032), and in Fall 2025 it was used by 21% of prize
+# winners and 0% of non-winners. It is also the most obviously sensible thing
+# in the list: a question about the FAO Cereal Price Index names the FAO page
+# that decides it, and news coverage is a worse source than the page itself.
+
+# Hosts that cost a request and return nothing useful: Metaculus is the
+# question we are already reading, and the rest serve a login wall or a
+# JavaScript shell to a plain HTTP client.
+_UNHELPFUL_HOSTS = re.compile(
+    r"(metaculus\.com|twitter\.com|x\.com|facebook\.com|instagram\.com|linkedin\.com"
+    r"|t\.co|bit\.ly|youtube\.com|youtu\.be|reddit\.com)",
+    re.I,
+)
+_URL = re.compile(r"https?://[^\s<>\])\"\',]+")
+_MAX_SOURCE_PAGES = 2
+_SOURCE_CHARS = 1500
+
+
+def resolution_source_urls(ctx: dict, limit: int = _MAX_SOURCE_PAGES) -> list[str]:
+    """Links the question itself gives for how it will be decided.
+
+    Read in order of authority: the resolution criteria name the deciding
+    source, the fine print qualifies it, the description is background.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for field in ("resolution_criteria", "fine_print", "description"):
+        for raw in _URL.findall(ctx.get(field) or ""):
+            url = raw.rstrip(".,;:)\'\"")
+            if _UNHELPFUL_HOSTS.search(url):
+                continue
+            key = url.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(url)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def resolution_sources(ctx: dict, report: ResearchReport, limit: int = _MAX_SOURCE_PAGES) -> None:
+    """Fetch the pages the question points at and hand over their text.
+
+    The text is whatever a stranger published on the internet, exactly like the
+    news evidence, and it is labelled as a quoted page rather than as fact.
+    """
+    for url in resolution_source_urls(ctx, limit):
+        try:
+            resp = requests.get(url, headers=UA, timeout=TIMEOUT, allow_redirects=True)
+            resp.raise_for_status()
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if "html" not in ctype and "text" not in ctype and "json" not in ctype:
+                report.errors.append(f"resolution source: {url[:60]} is {ctype[:30]}")
+                continue
+            body = _strip_page(resp.text)
+            # A page that strips to almost nothing is a cookie banner or a
+            # JavaScript shell. Low quality research measurably hurts: in the
+            # Fall 2025 comparison the bot that did no search at all outscored
+            # several search-equipped ones.
+            if len(body) < 40:
+                report.errors.append(f"resolution source: {url[:60]} had no readable text")
+                continue
+            report.add(
+                Evidence(
+                    source="Resolution source",
+                    title=url,
+                    detail=body[:_SOURCE_CHARS],
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            report.errors.append(f"resolution source {url[:50]}: {str(exc)[:80]}")
+
+
+_SCRIPTY = re.compile(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", re.S | re.I)
+
+
+def _strip_page(html_text: str) -> str:
+    text = _SCRIPTY.sub(" ", html_text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 # -- prediction markets ----------------------------------------------------
 def manifold(query: str, report: ResearchReport, n: int = 4) -> None:
     try:
@@ -273,10 +359,13 @@ def manifold(query: str, report: ResearchReport, n: int = 4) -> None:
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
-        for m in (resp.json() or [])[:n]:
+        rows = resp.json() or []
+        usable = 0
+        for m in rows[:n]:
             prob = m.get("probability")
             if prob is None:
                 continue
+            usable += 1
             report.add(
                 Evidence(
                     source="Manifold",
@@ -289,6 +378,10 @@ def manifold(query: str, report: ResearchReport, n: int = 4) -> None:
                     url=m.get("url") or "",
                 )
             )
+        if not usable:
+            # Silence here is ambiguous: no market exists, or the search shape
+            # changed again. Say which, so the next log answers it.
+            report.errors.append(f"manifold: {len(rows)} market(s) matched, none usable")
     except Exception as exc:  # noqa: BLE001
         report.errors.append(f"manifold: {exc}")
 
@@ -355,7 +448,11 @@ BACKGROUND_SOURCES = (wikipedia,)
 MARKET_SOURCES = (manifold, polymarket)
 
 
-def gather(queries: list[str], include_markets: bool = True) -> ResearchReport:
+def gather(
+    queries: list[str],
+    include_markets: bool = True,
+    ctx: dict | None = None,
+) -> ResearchReport:
     """Run every free source over the supplied queries.
 
     Sources fail independently. A dead endpoint costs a line in the error list,
@@ -374,6 +471,8 @@ def gather(queries: list[str], include_markets: bool = True) -> ResearchReport:
                 break  # the free allocation is finite; one good call is enough
     for fn in BACKGROUND_SOURCES:
         fn(primary, report)
+    if ctx:
+        resolution_sources(ctx, report)
     if include_markets:
         for fn in MARKET_SOURCES:
             fn(primary, report)
