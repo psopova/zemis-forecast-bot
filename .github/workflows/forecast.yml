@@ -14,6 +14,10 @@ on:
         description: run without submitting
         type: boolean
         default: false
+      watch:
+        description: keep polling for four hours instead of one pass
+        type: boolean
+        default: false
 
 concurrency:
   group: forecast-watcher
@@ -44,5 +48,6 @@ jobs:
         run: |
           python -m bot.runner \
             --mode "${{ inputs.mode || 'tournament' }}" \
-            ${{ github.event_name == 'schedule' && '--watch 14400 --interval 240' || '' }} \
+            ${{ (github.event_name == 'schedule' || inputs.watch) && '--watch 14400 --interval 240' || '' }} \
             ${{ inputs.dry_run && '--dry-run' || '' }}
+
