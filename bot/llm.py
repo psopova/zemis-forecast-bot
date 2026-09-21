@@ -93,27 +93,34 @@ PROVIDER_LIMITS: dict[str, tuple[float, int]] = {
 
 
 class _RateLimiter:
-    """A minimum spacing plus a concurrency cap, per provider."""
+    """A minimum spacing plus a concurrency cap, keyed by provider and model.
+
+    Free tiers meter each model separately, so throttling the provider as a
+    whole throws away most of the budget: an ensemble of three models has three
+    separate allowances, not one shared one.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._next_free: dict[str, float] = {}
         self._slots: dict[str, threading.Semaphore] = {}
 
-    def slot(self, name: str) -> threading.Semaphore:
+    def slot(self, key: str) -> threading.Semaphore:
+        provider = key.split("|", 1)[0]
         with self._lock:
-            if name not in self._slots:
-                _, concurrency = PROVIDER_LIMITS.get(name, (60.0, 4))
-                self._slots[name] = threading.Semaphore(concurrency)
-            return self._slots[name]
+            if key not in self._slots:
+                _, concurrency = PROVIDER_LIMITS.get(provider, (60.0, 4))
+                self._slots[key] = threading.Semaphore(concurrency)
+            return self._slots[key]
 
-    def wait(self, name: str) -> None:
-        rpm, _ = PROVIDER_LIMITS.get(name, (60.0, 4))
+    def wait(self, key: str) -> None:
+        provider = key.split("|", 1)[0]
+        rpm, _ = PROVIDER_LIMITS.get(provider, (60.0, 4))
         spacing = 60.0 / max(rpm, 1.0)
         with self._lock:
             now = time.monotonic()
-            start = max(now, self._next_free.get(name, 0.0))
-            self._next_free[name] = start + spacing
+            start = max(now, self._next_free.get(key, 0.0))
+            self._next_free[key] = start + spacing
         delay = start - time.monotonic()
         if delay > 0:
             time.sleep(delay)
@@ -185,6 +192,23 @@ def _provider_for(model: str) -> tuple[Provider, str]:
     )
 
 
+def _retry_delay(resp) -> float | None:
+    """How long the provider says to wait, from the header or the error body."""
+    header = resp.headers.get("Retry-After")
+    if header:
+        try:
+            return max(float(header), 1.0)
+        except ValueError:
+            pass
+    match = re.search(r'"retryDelay"\s*:\s*"?(\d+(?:\.\d+)?)s', resp.text or "")
+    if match:
+        try:
+            return max(float(match.group(1)), 1.0)
+        except ValueError:
+            pass
+    return None
+
+
 def _adapt_model_name(prov: Provider, model: str) -> str:
     """OpenRouter uses ``vendor/model``; the other providers want the bare name.
 
@@ -229,8 +253,9 @@ def chat(
 
     last = None
     for attempt in range(1, attempts + 1):
-        with LIMITER.slot(prov.name):
-            LIMITER.wait(prov.name)
+        limit_key = f"{prov.name}|{bare_model}"
+        with LIMITER.slot(limit_key):
+            LIMITER.wait(limit_key)
             try:
                 resp = requests.post(
                     f"{prov.base_url}/chat/completions",
@@ -245,14 +270,10 @@ def chat(
 
         if resp.status_code == 429:
             # Free tiers count per minute, so a few seconds of backoff just
-            # spends another request against the same exhausted window.
-            retry_after = resp.headers.get("Retry-After")
-            delay = 30.0 * attempt
-            if retry_after:
-                try:
-                    delay = max(float(retry_after), 5.0)
-                except ValueError:
-                    pass
+            # spends another request against the same exhausted window. Both
+            # the header and Google's error body say how long to wait; a run
+            # that ignored them spent 83 sleeps and still timed out.
+            delay = _retry_delay(resp) or 30.0 * attempt
             last = f"HTTP 429, waited {delay:.0f}s"
             log.info("%s rate limited, sleeping %.0fs", prov.name, delay)
             time.sleep(min(delay, 90.0))

@@ -39,7 +39,7 @@ RUNS_PER_QUESTION = _int_env("RUNS_PER_QUESTION", 5)
 # On a metered free tier, five runs a question exhausts the per minute budget
 # before the first question finishes, and a question nobody forecasts scores
 # zero. Three runs that land beat five that 429.
-RUNS_PER_QUESTION_METERED = _int_env("RUNS_PER_QUESTION_METERED", 3)
+RUNS_PER_QUESTION_METERED = _int_env("RUNS_PER_QUESTION_METERED", 2)
 ENSEMBLE_MODELS = _int_env("ENSEMBLE_MODELS", 3)
 
 # Questions are open to bots for about three hours, so a tick that takes longer

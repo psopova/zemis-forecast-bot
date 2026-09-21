@@ -275,3 +275,50 @@ def test_openrouter_keeps_its_vendor_prefix_in_the_call(monkeypatch):
     prov, bare = llm._provider_for("openrouter/openai/gpt-6-astra")
     assert prov.name == "openrouter"
     assert bare == "openai/gpt-6-astra"
+
+
+# --------------------------------------------------------------------------
+# Throughput. Run #7 spent 83 rate-limit sleeps and timed out with a third of
+# the questions unforecast, which under this scoring rule is the same as
+# getting them wrong.
+# --------------------------------------------------------------------------
+def test_each_model_gets_its_own_allowance():
+    """Free tiers meter per model, so three models are three budgets, not one."""
+    import time as _time
+
+    from bot.llm import PROVIDER_LIMITS, _RateLimiter
+
+    PROVIDER_LIMITS.setdefault("slowfake", (60.0, 2))
+    limiter = _RateLimiter()
+
+    started = _time.monotonic()
+    limiter.wait("slowfake|model-a")
+    limiter.wait("slowfake|model-b")
+    limiter.wait("slowfake|model-c")
+    spread = _time.monotonic() - started
+    assert spread < 0.3, f"different models must not queue behind each other ({spread:.2f}s)"
+
+    started = _time.monotonic()
+    limiter.wait("slowfake|model-a")
+    limiter.wait("slowfake|model-a")
+    same = _time.monotonic() - started
+    assert same >= 0.9, f"the same model must be spaced ({same:.2f}s)"
+
+
+class _FakeRateLimited:
+    def __init__(self, headers=None, text=""):
+        self.headers = headers or {}
+        self.text = text
+        self.status_code = 429
+
+
+def test_the_stated_retry_delay_is_used():
+    """Google puts the wait in the error body; guessing ignored it."""
+    from bot.llm import _retry_delay
+
+    assert _retry_delay(_FakeRateLimited({"Retry-After": "17"})) == 17.0
+    body = '{"error":{"code":429,"details":[{"retryDelay":"23s"}]}}'
+    assert _retry_delay(_FakeRateLimited(text=body)) == 23.0
+    assert _retry_delay(_FakeRateLimited(text="no idea")) is None
+    # A header takes precedence over the body.
+    assert _retry_delay(_FakeRateLimited({"Retry-After": "5"}, body)) == 5.0
