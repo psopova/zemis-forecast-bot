@@ -131,16 +131,28 @@ def gdelt_query(text: str) -> str:
     return " ".join(keep[:8])
 
 
+# GDELT rate limits by egress address, and GitHub Actions runners share a small
+# pool of them, so a 429 is a statement about the runner rather than about this
+# query. A watcher runs a pass every four minutes for four hours; without a
+# cooldown it pays two round trips and a three second sleep per question, every
+# pass, for nothing. Sit out for a while after a refusal instead.
+GDELT_COOLDOWN_SECONDS = 900.0
+_gdelt_blocked_until = 0.0
+
+
 def gdelt(query: str, report: ResearchReport, n: int = 8, days: int = 21) -> None:
     """GDELT's document API is public and keyless, but it rate-limits hard.
 
-    GitHub Actions runners share a small pool of egress addresses, so 429 is the
-    common case there rather than the exception. One short retry is worth it; a
-    long one is not, because the question closes in three hours and every other
-    source is still available.
+    One short retry is worth it; a long one is not, because the question closes
+    in three hours and every other source is still available.
     """
+    global _gdelt_blocked_until
+
     query = gdelt_query(query)
     if len(query.split()) < 2:
+        return
+    if time.monotonic() < _gdelt_blocked_until:
+        report.errors.append("gdelt: rate limited, sitting out")
         return
     try:
         params = {
@@ -165,6 +177,10 @@ def gdelt(query: str, report: ResearchReport, n: int = 8, days: int = 21) -> Non
                 headers=UA,
                 timeout=TIMEOUT,
             )
+        if resp.status_code == 429:
+            _gdelt_blocked_until = time.monotonic() + GDELT_COOLDOWN_SECONDS
+            report.errors.append("gdelt: rate limited, sitting out")
+            return
         resp.raise_for_status()
         if "json" not in (resp.headers.get("content-type") or ""):
             raise ValueError(f"non-JSON response: {resp.text[:80]!r}")

@@ -218,8 +218,13 @@ def _adapt_model_name(prov: Provider, model: str) -> str:
     strip also turns Google's catalogue form "models/gemini-2.5-pro" into the
     "gemini-2.5-pro" its OpenAI-compatible endpoint is documented with, and
     leaves a bare Groq id such as "llama-3.3-70b-versatile" untouched.
+
+    Groq is the exception a blanket strip gets wrong: it serves ids like
+    "meta-llama/llama-4-maverick-17b-128e-instruct" and "openai/gpt-oss-120b",
+    where the slash is part of the name and removing it produces a 404. Groq
+    and OpenRouter ids go out exactly as their catalogues gave them.
     """
-    if prov.name == "openrouter":
+    if prov.name in ("openrouter", "groq"):
         return model
     return model.split("/", 1)[1] if "/" in model else model
 
@@ -340,8 +345,12 @@ _CATALOGUE_CACHE: list[dict] | None = None
 # "models/aqa", which is an attributed-question-answering endpoint and returns
 # 404 for generateContent, and "gemini-2.5-pro", which Google has closed to new
 # keys. Both cost a whole run.
+# Groq adds two more shapes of the same mistake: "whisper-large-v3" is speech
+# to text and "llama-guard-4" is a safety classifier that answers "safe", not a
+# forecast. Both survive the OpenRouter-shaped EXCLUDE list.
 _NOT_A_CHAT_MODEL = re.compile(
-    r"(aqa|embed|imagen|veo|image-gen|^models/text-|tts|speech|audio|live|vision-only|learnlm)",
+    r"(aqa|embed|imagen|veo|image-gen|^models/text-|tts|speech|audio|live"
+    r"|vision-only|learnlm|whisper|guard|prompt-?guard|moderation|rerank)",
     re.I,
 )
 
@@ -359,6 +368,34 @@ def active_provider() -> Provider | None:
         if PROVIDERS[name].key:
             return PROVIDERS[name]
     return None
+
+
+def keyed_providers() -> list[Provider]:
+    """Every provider this run holds a usable key for, in preference order.
+
+    METACULUS_TOKEN is always set, because it is also how the bot posts its
+    forecasts, so the proxy would otherwise always look available. Until the
+    sponsored credits land it answers "you don\'t have an allowance" to every
+    model, so it only joins the ensemble when nothing else is keyed.
+    """
+    named = [PROVIDERS[n] for n in ("openrouter", "gemini", "groq") if PROVIDERS[n].key]
+    if named:
+        return named
+    return [PROVIDERS["metaculus"]] if PROVIDERS["metaculus"].key else []
+
+
+def _round_robin(served: dict[str, list[str]], count: int) -> list[str]:
+    """One model from each provider before a second from any of them."""
+    picked: list[str] = []
+    depth = 0
+    while len(picked) < count and any(len(v) > depth for v in served.values()):
+        for name, models in served.items():
+            if depth < len(models):
+                picked.append(f"{name}/{models[depth]}")
+                if len(picked) >= count:
+                    break
+        depth += 1
+    return picked
 
 
 def provider_catalogue(prov: Provider) -> list[str]:
@@ -428,15 +465,29 @@ def resolve_models(count: int = 3) -> list[str]:
     if override:
         return [m.strip() for m in override.split(",") if m.strip()]
 
-    prov = active_provider()
-    if prov is not None and prov.name != "openrouter":
-        # No OpenRouter key, so the ensemble comes from whichever provider we
-        # do have. Ask it what it serves; hardcoding names is what produced
+    keyed = keyed_providers()
+    if keyed and not any(p.name == "openrouter" for p in keyed):
+        # No OpenRouter key, so the ensemble comes from whichever providers we
+        # do have. Ask each what it serves; hardcoding names is what produced
         # "You don\'t have an allowance for model <openai/gpt-5>".
-        served = _rank_bare(provider_catalogue(prov))
-        if served:
-            return [f"{prov.name}/{mid}" for mid in served[:count]]
-        log.warning("%s served no model list; falling back", prov.name)
+        #
+        # Spread across providers rather than taking three models from one. Two
+        # reasons, and the second is the one that showed up in production: three
+        # models from one family make correlated mistakes, and three models on
+        # one free tier share one allowance. A live watcher on a Gemini-only
+        # ensemble spent most of its wall clock asleep on 429s while a perfectly
+        # good Groq key sat unused.
+        served = {}
+        for prov in keyed:
+            ranked = _rank_bare(provider_catalogue(prov))
+            if ranked:
+                served[prov.name] = ranked
+            else:
+                log.warning("%s served no model list", prov.name)
+        picked = _round_robin(served, count)
+        if picked:
+            return picked
+        log.warning("no keyed provider served a model list; falling back")
 
     catalogue = _catalogue()
     if not catalogue:

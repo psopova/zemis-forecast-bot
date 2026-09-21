@@ -87,11 +87,15 @@ def test_a_working_ensemble_is_unaffected(monkeypatch):
         ("metaculus", "openai/gpt-5", "gpt-5"),
         ("metaculus", "anthropic/claude-sonnet-4", "claude-sonnet-4"),
         ("metaculus", "gpt-4o", "gpt-4o"),
-        ("groq", "meta/llama-3", "llama-3"),
+        # Groq ids contain a slash of their own; stripping it gave a 404.
+        ("groq", "meta-llama/llama-4-maverick-17b-128e-instruct",
+         "meta-llama/llama-4-maverick-17b-128e-instruct"),
+        ("groq", "openai/gpt-oss-120b", "openai/gpt-oss-120b"),
+        ("groq", "llama-3.3-70b-versatile", "llama-3.3-70b-versatile"),
         ("gemini", "google/gemini-2.5-pro", "gemini-2.5-pro"),
     ],
 )
-def test_vendor_prefix_is_stripped_for_everything_but_openrouter(provider, model, expected):
+def test_each_provider_gets_the_model_name_it_actually_serves(provider, model, expected):
     assert _adapt_model_name(llm.PROVIDERS[provider], model) == expected
 
 

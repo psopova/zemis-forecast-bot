@@ -4,6 +4,7 @@
 import pytest
 
 
+from bot import llm
 from bot.llm import MODEL_PREFERENCES, STATIC_FALLBACK, extract_json, resolve_models
 
 
@@ -322,3 +323,70 @@ def test_the_stated_retry_delay_is_used():
     assert _retry_delay(_FakeRateLimited(text="no idea")) is None
     # A header takes precedence over the body.
     assert _retry_delay(_FakeRateLimited({"Retry-After": "5"}, body)) == 5.0
+
+
+# -- ensembles across providers -------------------------------------------
+# A live watcher resolved three Gemini flash models while a working Groq key
+# sat unused, then spent most of its wall clock asleep on Gemini's 429s. Three
+# models on one free tier share one allowance, and they make correlated
+# mistakes, which is the thing ensembling is supposed to avoid.
+
+
+def _serve(monkeypatch, catalogues):
+    monkeypatch.setattr(llm, "_CATALOGUE_CACHE", None, raising=False)
+    monkeypatch.setattr(
+        llm, "provider_catalogue", lambda prov: list(catalogues.get(prov.name, []))
+    )
+
+
+def test_the_ensemble_spreads_across_every_keyed_provider(monkeypatch):
+    monkeypatch.delenv("BOT_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("GROQ_API_KEY", "q")
+    monkeypatch.setenv("METACULUS_TOKEN", "t")
+    _serve(
+        monkeypatch,
+        {
+            "gemini": ["models/gemini-3.8-flash", "models/gemini-3.7-flash"],
+            "groq": ["llama-4-70b", "qwen-3-32b"],
+        },
+    )
+    picked = llm.resolve_models(3)
+    providers = [m.split("/", 1)[0] for m in picked]
+    assert providers[:2] == ["gemini", "groq"], picked
+    assert len(set(providers)) == 2, picked
+    # The Metaculus token is always set, so it must not crowd out a real key.
+    assert not any(m.startswith("metaculus/") for m in picked), picked
+
+
+def test_one_keyed_provider_still_fills_the_ensemble(monkeypatch):
+    monkeypatch.delenv("BOT_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("METACULUS_TOKEN", "t")
+    _serve(
+        monkeypatch,
+        {
+            "gemini": [
+                "models/gemini-3.8-flash",
+                "models/gemini-3.7-flash",
+                "models/gemini-3.6-flash",
+            ]
+        },
+    )
+    picked = llm.resolve_models(3)
+    assert len(picked) == 3
+    assert all(m.startswith("gemini/") for m in picked), picked
+
+
+def test_the_proxy_is_used_only_when_nothing_else_is_keyed(monkeypatch):
+    monkeypatch.delenv("BOT_MODELS", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("METACULUS_TOKEN", "t")
+    _serve(monkeypatch, {"metaculus": ["gpt-5", "claude-sonnet-4"]})
+    picked = llm.resolve_models(2)
+    assert all(m.startswith("metaculus/") for m in picked), picked
