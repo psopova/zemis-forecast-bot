@@ -1,8 +1,21 @@
 name: forecast
 
+# GitHub's cron does not work for this repository. Over the first two days it
+# fired twice against a schedule asking every fifteen minutes, and after the
+# workflow was disabled and re-enabled it stopped firing for over an hour.
+# Questions are open to bots for about three hours, and a question never
+# forecast scores the same as one forecast badly, so coverage cannot depend on
+# it.
+#
+# So a watcher no longer does one pass and exit. It polls inside a single job
+# for five and a half hours, and on the way out it starts its replacement. The
+# cron below stays only as a safety net for when the chain breaks. The
+# concurrency group means one watcher at a time: a firing that arrives while
+# one is running waits its turn rather than doubling up. Manual runs without
+# the watch box ticked still do a single pass.
 on:
   schedule:
-    - cron: "3,18,33,48 * * * *"
+    - cron: "7 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -15,7 +28,7 @@ on:
         type: boolean
         default: false
       watch:
-        description: keep polling for four hours instead of one pass
+        description: keep polling for five and a half hours instead of one pass
         type: boolean
         default: false
 
@@ -29,7 +42,10 @@ permissions:
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 250
+    # A job is killed at six hours. The watch window is deliberately shorter,
+    # so the process exits on its own terms: a job killed by the timeout counts
+    # as cancelled, and the handover step below does not run on cancellation.
+    timeout-minutes: 345
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,6 +53,8 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: note when this watcher started
+        run: echo "WATCH_STARTED=$(date +%s)" >> "$GITHUB_ENV"
       - name: forecast
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
@@ -48,6 +66,38 @@ jobs:
         run: |
           python -m bot.runner \
             --mode "${{ inputs.mode || 'tournament' }}" \
-            ${{ (github.event_name == 'schedule' || inputs.watch) && '--watch 14400 --interval 240' || '' }} \
+            ${{ (github.event_name == 'schedule' || inputs.watch) && '--watch 19800 --interval 240' || '' }} \
             ${{ inputs.dry_run && '--dry-run' || '' }}
-
+      - name: hand over to the next watcher
+        # Only a watcher hands over, never a one-off manual pass.
+        #
+        # success() || failure() rather than always(): a cancelled run was
+        # stopped by a person, and restarting it would be arguing with them.
+        if: ${{ (success() || failure()) && (github.event_name == 'schedule' || inputs.watch) }}
+        env:
+          GH_TOKEN: ${{ secrets.WATCHER_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::WATCHER_PAT is not set, so this watcher cannot start the next one. Coverage stops here."
+            exit 0
+          fi
+          elapsed=$(( $(date +%s) - ${WATCH_STARTED:-0} ))
+          echo "this watcher ran for ${elapsed}s"
+          # A watcher that dies in minutes is broken, and chaining it would
+          # spend the whole Actions allowance rediscovering that every few
+          # minutes. Stop, and let the hourly cron or a person restart it.
+          if [ "${elapsed}" -lt 1200 ]; then
+            echo "::warning::only ${elapsed}s before exiting, so not chaining. Fix the failure and start one by hand."
+            exit 0
+          fi
+          since=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          recent=$(gh run list --workflow forecast.yml --limit 40 \
+            --json createdAt --jq "[.[] | select(.createdAt > \"${since}\")] | length")
+          if [ "${recent:-0}" -gt 4 ]; then
+            echo "::warning::${recent} runs since ${since}, so not chaining."
+            exit 0
+          fi
+          gh workflow run forecast.yml --ref "${GITHUB_REF_NAME}" -f mode=tournament -f watch=true
+          echo "next watcher requested"
